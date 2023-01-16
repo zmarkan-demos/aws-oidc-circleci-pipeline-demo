@@ -2,8 +2,10 @@ version: 2.1
 
 orbs: 
   node: circleci/node@5.0.3
-  snyk: snyk/snyk@1.4.0
   docker: circleci/docker@2.2.0
+  aws-cli: circleci/aws-cli@3.1.4
+  aws-ecr: circleci/aws-ecr@8.2.1
+
 
 jobs:
   build-and-test:
@@ -20,37 +22,19 @@ jobs:
       - run:
           name: Run tests
           command: |
-            echo $(circleci tests glob "test/**/*.test.js")
-            circleci tests glob "test/**/*.test.js" | circleci tests split |
-            xargs npm run test-ci
+            npm run test-ci
       - run:
           name: Copy tests results for storing
           command: |
             mkdir test-results
             cp test-results.xml test-results/
           when: always
-      - run:
-          name: Process test report
-          command: |
-              # Convert absolute paths to relative to support splitting tests by timing
-              if [ -e test-results.xml ]; then
-                sed -i "s|`pwd`/||g" test-results.xml
-              fi
       - store_test_results:
           path: test-results
       - store_artifacts:
           path: test-results
 
-  dependency-vulnerability-scan:
-    docker:
-      - image: cimg/node:16.14.0
-    steps:
-      - checkout
-      - node/install-packages
-      - snyk/scan:
-          fail-on-issues: true
-
-  build-docker:
+  build-and-publish-image-to-docker-hub:
     docker:
       - image: cimg/base:stable
     steps:
@@ -58,23 +42,63 @@ jobs:
       - setup_remote_docker
       - docker/check
       - docker/build:
-          image: $DOCKER_LOGIN/${CIRCLE_PROJECT_REPONAME}-1-march-22
+          image: $DOCKER_LOGIN/${CIRCLE_PROJECT_REPONAME}
           tag: 0.1.<< pipeline.number >>
       - docker/push:
-          image: $DOCKER_LOGIN/${CIRCLE_PROJECT_REPONAME}-1-march-22
+          image: $DOCKER_LOGIN/${CIRCLE_PROJECT_REPONAME}
           tag: 0.1.<< pipeline.number >>
   
+  build_and_publish_image_to_aws_ecr:
+    docker:
+      - image: cimg/aws:2022.06
+    steps:
+      - checkout
+      - setup_remote_docker
+      - aws-cli/setup:
+          role-arn: 'arn:aws:iam::715930815444:role/oicd-ecr-upload-role'
+          # optional parameters
+          profile-name: "OIDC-PROFILE"
+          role-session-name: circleci-aws-ecr-publish-job
+          session-duration: "1800"
+      - run:
+         name: Log-into-AWS-ECR
+         command: |
+           # must use same profile specified in the step above       
+           aws_ecr_pwd=$(aws ecr get-login-password --profile "OIDC-PROFILE")
+           echo $aws_ecr_pwd
+           echo "export DOCKER_PASSWORD=$aws_ecr_pwd" >> "$BASH_ENV"
+           source $BASH_ENV
+           echo "export AWS_DOCKER_LOGIN=AWS" >> "$BASH_ENV"
+           source $BASH_ENV
+           
+      - docker/check:
+          registry: $AWS_ECR_REGISTRY
+          docker-username: AWS_DOCKER_LOGIN
+      - docker/build:
+          image: cci-demo-cr
+          registry: $AWS_ECR_REGISTRY
+          tag: 0.1.<< pipeline.number >>
+      - docker/push:
+          image: cci-demo-cr
+          tag: 0.1.<< pipeline.number >>
+          registry: $AWS_ECR_REGISTRY
+
+
+
 workflows:
-  test=deploy:
+  test-deploy:
     jobs:
-      - build-and-test:
-          matrix:
-                parameters:
-                  node_version: ["16.14.0", "14.19.0", "17.6.0" ]
-      - dependency-vulnerability-scan
-      - build-docker:
+      - build-and-test
+      - build-and-publish-image-to-docker-hub:
           requires:
             - build-and-test
-            - dependency-vulnerability-scan
+          context:
+            - docker_hub
+      - build_and_publish_image_to_aws_ecr:
+          requires:
+            - build-and-test
+          context:
+            - aws
     
 # VS Code Extension Version: 1.5.1
+
